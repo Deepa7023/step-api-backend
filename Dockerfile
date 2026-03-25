@@ -20,5 +20,7 @@ RUN pip install --no-cache-dir cadquery-ocp==7.9.3.1
 # Copy your app
 COPY . /app
 
-EXPOSE 8000
-CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000"]
+# Render expects a web service to listen on 0.0.0.0:$PORT (default 10000)
+# Use the shell-form CMD so $PORT expands at runtime.
+EXPOSE 10000
+CMD ["sh","-c","uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
