@@ -1,26 +1,23 @@
-FROM mambaorg/micromamba:1.5.8
+FROM python:3.10-slim
 
-USER root
+# System packages needed by OCP wheels and FastAPI
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx libgl1-mesa-dev libglu1-mesa \
+    libxrender1 libsm6 libxext6 \
+    build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy environment file
-COPY environment.yml .
+# Python deps
+RUN pip install --no-cache-dir fastapi uvicorn[standard] pydantic==1.10.13 numpy
+# Open Cascade Python bindings (prebuilt wheel)
+RUN pip install --no-cache-dir OCP==7.7.0
 
-# Create environment using micromamba (faster and more reliable)
-RUN micromamba create -f environment.yml && \
-    micromamba clean --all --yes
+# Copy your code (repo root → /app)
+COPY . /app
 
-# Copy application code
-COPY ./app /app/app
-
-# Expose port
 EXPOSE 8000
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV MAMBA_DOCKERFILE_ACTIVATE=1
-
-# Activate environment and run
-CMD ["/usr/local/bin/_dockerfile_shell.sh", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Start FastAPI server (assumes main.py contains "app = FastAPI()")
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
