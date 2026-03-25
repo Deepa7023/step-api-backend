@@ -2,4 +2,5 @@ fastapi
 uvicorn[standard]
 pydantic==1.10.13
 numpy
+python-multipart
 OCP==7.7.0
