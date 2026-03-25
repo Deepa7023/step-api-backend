@@ -3,4 +3,4 @@ uvicorn[standard]
 pydantic==1.10.13
 numpy
 python-multipart
-OCP==7.7.0
+cadquery-ocp==7.9.3.1
