@@ -6,8 +6,8 @@ import tempfile, os
 from OCP.STEPControl import STEPControl_Reader
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.Bnd import Bnd_Box
-from OCP.BRepBndLib import BRepBndLib               # <- class with static methods
-from OCP.BRepGProp import BRepGProp                 # <- static VolumeProperties/SurfaceProperties
+from OCP.BRepBndLib import BRepBndLib          # static methods
+from OCP.BRepGProp import BRepGProp            # static methods
 from OCP.GProp import GProp_GProps
 
 app = FastAPI(title="STEP Geometry API", version="1.0")
@@ -24,8 +24,7 @@ def read_step_shape(path: str):
 def compute_bbox(shape):
     bbox = Bnd_Box()
     bbox.SetGap(0.0)
-    # In OCP use the static method 'Add', not 'brepbndlib_Add'
-    BRepBndLib.Add(shape, bbox, True)   # useTriangulation=True
+    BRepBndLib.Add(shape, bbox, True)  # useTriangulation=True
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
     return {
         "xmin": xmin, "ymin": ymin, "zmin": zmin,
@@ -36,14 +35,11 @@ def compute_bbox(shape):
     }
 
 def compute_geom(shape):
-    vol_props = GProp_GProps()
-    area_props = GProp_GProps()
-    # Static calls per OCCT/OCP API
-    BRepGProp.VolumeProperties(shape, vol_props)      # mm^3
-    BRepGProp.SurfaceProperties(shape, area_props)    # mm^2
-    vol_mm3 = vol_props.Mass()
-    area_mm2 = area_props.Mass()
-    return vol_mm3, area_mm2
+    gv = GProp_GProps()
+    ga = GProp_GProps()
+    BRepGProp.VolumeProperties(shape, gv)     # mm^3
+    BRepGProp.SurfaceProperties(shape, ga)    # mm^2
+    return gv.Mass(), ga.Mass()
 
 @app.get("/health")
 def health():
