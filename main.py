@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import tempfile, os
 
-# ---- OpenCascade / OCP imports ----
+# ---- OpenCascade / OCP imports (from cadquery-ocp) ----
 from OCP.STEPControl import STEPControl_Reader
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.Bnd import Bnd_Box
@@ -37,8 +37,8 @@ def compute_bbox(shape):
 def compute_geom(shape):
     g_v = GProp_GProps()
     g_a = GProp_GProps()
-    brepgprop_VolumeProperties(shape, g_v)   # volume in mm^3
-    brepgprop_SurfaceProperties(shape, g_a)  # area in mm^2
+    brepgprop_VolumeProperties(shape, g_v)   # mm^3
+    brepgprop_SurfaceProperties(shape, g_a)  # mm^2
     vol_mm3 = g_v.Mass()
     area_mm2 = g_a.Mass()
     return vol_mm3, area_mm2
