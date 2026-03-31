@@ -290,7 +290,7 @@ def analyze_base64(req: AnalyzeBase64Request):
 def _process_job(job_id: str, req: AnalyzeBase64Request) -> None:
     """
     Runs after /analyze_base64_submit returns.
-    BackgroundTasks is intended for "return now, work later". [1](https://learn.microsoft.com/en-us/answers/questions/93882/getting-the-server-didnot-receive-the-response-fro)[2](https://stackoverflow.com/questions/77174588/microsoft-power-apps-bad-gateway-error-on-app-that-was-working)
+    BackgroundTasks is intended for "return now, work later".
     """
     try:
         _write_job(job_id, {"status": "processing", "updated_utc": time.time()})
@@ -310,7 +310,8 @@ def _process_job(job_id: str, req: AnalyzeBase64Request) -> None:
 @app.post("/analyze_base64_submit", status_code=202)
 async def analyze_base64_submit(req: AnalyzeBase64Request, background_tasks: BackgroundTasks):
     """
-    Returns quickly with job_id, then processes STEP in background. [1](https://learn.microsoft.com/en-us/answers/questions/93882/getting-the-server-didnot-receive-the-response-fro)[2](https://stackoverflow.com/questions/77174588/microsoft-power-apps-bad-gateway-error-on-app-that-was-working)
+    Returns quickly with job_id, then processes STEP in background.
+    FastAPI BackgroundTasks is the official way to run tasks after returning a response. [3](https://learn.microsoft.com/en-us/answers/questions/93882/getting-the-server-didnot-receive-the-response-fro)[4](https://stackoverflow.com/questions/77174588/microsoft-power-apps-bad-gateway-error-on-app-that-was-working)
     """
     if not req.filename.lower().endswith((".stp", ".step")):
         raise HTTPException(status_code=400, detail="filename must end with .stp or .step")
@@ -328,4 +329,3 @@ async def analyze_result(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="job_id not found")
     return job
-``
