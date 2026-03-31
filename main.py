@@ -1,197 +1,136 @@
-# main.py
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import tempfile
 import os
+import json
+import uuid
+import time
 import base64
 import binascii
+from pathlib import Path
+from typing import Optional, Dict, Any
 
-# ---- OpenCascade via OCP (cadquery-ocp) ----
-from OCP.STEPControl import STEPControl_Reader
-from OCP.IFSelect import IFSelect_RetDone
-from OCP.Bnd import Bnd_Box
-from OCP.BRepBndLib import BRepBndLib
-from OCP.BRepGProp import BRepGProp
-from OCP.GProp import GProp_GProps
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from pydantic import BaseModel
 
-app = FastAPI(title="STEP Geometry API", version="1.2")
+app = FastAPI()
 
+# Folder to store job status/results (survives while container is running)
+JOB_DIR = Path(os.environ.get("JOB_DIR", "/tmp/step_jobs"))
+JOB_DIR.mkdir(parents=True, exist_ok=True)
 
-# --------------------------
-# Core OCCT helper routines
-# --------------------------
-def read_step_shape(path: str):
-    """Read a STEP file and return a TopoDS_Shape."""
-    reader = STEPControl_Reader()
-    status = reader.ReadFile(path)  # must return IFSelect_RetDone for success [1](https://www.desmos.com/api/geometry)
-    if status != IFSelect_RetDone:
-        raise ValueError("Failed to read STEP file (IFSelect_RetDone not returned).")
-    if not reader.TransferRoots():
-        raise ValueError("STEP transfer failed.")
-    return reader.OneShape()
-
-
-def compute_bbox(shape):
-    bbox = Bnd_Box()
-    bbox.SetGap(0.0)
-    BRepBndLib.Add_s(shape, bbox, True)
-    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-    return {
-        "xmin": xmin, "ymin": ymin, "zmin": zmin,
-        "xmax": xmax, "ymax": ymax, "zmax": zmax,
-        "length_mm": xmax - xmin,
-        "width_mm":  ymax - ymin,
-        "height_mm": zmax - zmin
-    }
-
-
-def compute_geom(shape):
-    vol_props = GProp_GProps()
-    area_props = GProp_GProps()
-    BRepGProp.VolumeProperties_s(shape, vol_props)
-    BRepGProp.SurfaceProperties_s(shape, area_props)
-    return vol_props.Mass(), area_props.Mass()
-
-
-# --------------------------
-# Request model (Swagger will show correct fields)
-# --------------------------
-class AnalyzeBase64Request(BaseModel):
+# -----------------------------
+# Request model for submit API
+# -----------------------------
+class AnalyzeSubmitRequest(BaseModel):
     filename: str
     content_b64: str
 
 
-# --------------------------
-# Base64 utilities (handles PA + Swagger)
-# --------------------------
-def normalize_b64(b64: str) -> str:
-    s = b64.strip()
-
-    # If someone sends data URI, strip prefix:
-    # data:application/octet-stream;base64,AAA...
+def _normalize_b64(b64: str) -> str:
+    """Remove data:...base64, prefix, whitespace, and fix padding."""
+    s = (b64 or "").strip()
     if s.lower().startswith("data:") and "," in s:
         s = s.split(",", 1)[1]
-
-    # remove whitespace/newlines
     s = "".join(s.split())
-
-    # fix padding
     pad = len(s) % 4
     if pad != 0:
         s += "=" * (4 - pad)
-
     return s
 
 
-def decode_b64(b64: str) -> bytes:
-    s = normalize_b64(b64)
+def _decode_b64_to_bytes(b64: str) -> bytes:
+    s = _normalize_b64(b64)
     try:
         return base64.b64decode(s, validate=True)
     except (binascii.Error, ValueError) as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"content_b64 is not valid base64: {str(e)}"
-        )
+        raise HTTPException(status_code=400, detail=f"content_b64 is not valid base64: {str(e)}")
 
 
-def assert_step_signature(data: bytes):
-    head = data.lstrip()[:200]
-    if b"ISO-10303-21" not in head:
-        raise HTTPException(
-            status_code=400,
-            detail="Decoded bytes do not look like a STEP Part 21 file "
-                   "(missing 'ISO-10303-21' near start). "
-                   "Most common causes: placeholder text, Power Automate expressions sent to Swagger, "
-                   "or base64 truncated."
-        )
+def _write_job(job_id: str, payload: Dict[str, Any]) -> None:
+    (JOB_DIR / f"{job_id}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+def _read_job(job_id: str) -> Optional[Dict[str, Any]]:
+    p = JOB_DIR / f"{job_id}.json"
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
-# --------------------------
-# Multipart endpoint (for Postman/clients)
-# --------------------------
-@app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
-    name = (file.filename or "").lower()
-    if not (name.endswith(".stp") or name.endswith(".step")):
-        raise HTTPException(status_code=400, detail="Only .stp/.step files supported.")
+# -----------------------------
+# IMPORTANT: plug your existing STEP analysis here
+# -----------------------------
+def analyze_step_bytes(step_bytes: bytes, filename: str) -> Dict[str, Any]:
+    """
+    Reuse your existing /analyze_base64 logic here.
+    It should return the SAME JSON structure you already return today:
+    {
+      "file": "...",
+      "bounding_box_mm": {...},
+      "solid_volume": {"mm3":..., "m3":...},
+      "surface_area": {"mm2":..., "m2":...},
+      "units": {...}
+    }
+    """
+    # ✅ OPTION 1: If you already have a helper function that reads a temp file, use it:
+    #   - write bytes to temp .stp
+    #   - call your existing OpenCascade read/compute functions
+    #
+    # Replace the next line with your real implementation:
+    raise NotImplementedError("Replace analyze_step_bytes() with your existing OCCT code.")
 
-    tmp_path = None
+
+def _process_job(job_id: str, req: AnalyzeSubmitRequest) -> None:
+    """Runs after submit returns 202. Writes status/result to JOB_DIR."""
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
-            tmp_path = tmp.name
-            # stream to disk
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                tmp.write(chunk)
+        # Update status to processing
+        _write_job(job_id, {"status": "processing", "updated_utc": time.time()})
 
-        shape = read_step_shape(tmp_path)
-        bbox = compute_bbox(shape)
-        vol_mm3, area_mm2 = compute_geom(shape)
+        # Decode base64 and analyze STEP
+        step_bytes = _decode_b64_to_bytes(req.content_b64)
 
-        return JSONResponse({
-            "file": file.filename,
-            "bounding_box_mm": bbox,
-            "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
-            "surface_area": {"mm2": area_mm2, "m2": area_mm2 * 1e-6},
-            "units": {"length": "mm", "area": "mm2/m2", "volume": "mm3/m3"}
-        })
+        # Optional quick signature check (STEP Part 21 files contain ISO-10303-21 near the top)
+        head = step_bytes.lstrip()[:200]
+        if b"ISO-10303-21" not in head:
+            raise HTTPException(
+                status_code=400,
+                detail="Decoded bytes do not look like a STEP Part 21 file (missing 'ISO-10303-21')."
+            )
 
-    except HTTPException:
-        raise
+        data = analyze_step_bytes(step_bytes, req.filename)
+
+        # Save result
+        _write_job(job_id, {"status": "done", "data": data, "updated_utc": time.time()})
+
+    except HTTPException as he:
+        _write_job(job_id, {"status": "failed", "error": he.detail, "updated_utc": time.time()})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        _write_job(job_id, {"status": "failed", "error": str(e), "updated_utc": time.time()})
 
 
-# --------------------------
-# JSON base64 endpoint (Power Automate)
-# --------------------------
-@app.post("/analyze_base64")
-def analyze_base64(req: AnalyzeBase64Request):
-    tmp_path = None
-    try:
-        if not req.filename.lower().endswith((".stp", ".step")):
-            raise HTTPException(status_code=400, detail="filename must end with .stp or .step")
+@app.post("/analyze_base64_submit", status_code=202)
+async def analyze_base64_submit(req: AnalyzeSubmitRequest, background_tasks: BackgroundTasks):
+    """
+    Returns immediately with job_id, then processes the STEP in background.
+    FastAPI BackgroundTasks are designed to run after returning a response. [1](https://fastapi.tiangolo.com/tutorial/background-tasks/)[2](https://github.com/fastapi/fastapi/blob/master/docs/en/docs/tutorial/background-tasks.md)
+    """
+    if not req.filename.lower().endswith((".stp", ".step")):
+        raise HTTPException(status_code=400, detail="filename must end with .stp or .step")
 
-        data = decode_b64(req.content_b64)
-        assert_step_signature(data)
+    job_id = str(uuid.uuid4())
+    _write_job(job_id, {"status": "queued", "updated_utc": time.time()})
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
+    # Run heavy processing after response
+    background_tasks.add_task(_process_job, job_id, req)
 
-        shape = read_step_shape(tmp_path)  # IFSelect_RetDone must be returned for success [1](https://www.desmos.com/api/geometry)
-        bbox = compute_bbox(shape)
-        vol_mm3, area_mm2 = compute_geom(shape)
+    return {"job_id": job_id}
 
-        return {
-            "file": req.filename,
-            "bounding_box_mm": bbox,
-            "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
-            "surface_area": {"mm2": area_mm2, "m2": area_mm2 * 1e-6},
-            "units": {"length": "mm", "area": "mm2/m2", "volume": "mm3/m3"}
-        }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+@app.get("/analyze_result/{job_id}")
+async def analyze_result(job_id: str):
+    """
+    Poll this endpoint until status becomes done/failed.
+    """
+    job = _read_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    return job
+``
