@@ -12,6 +12,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+
 # ----------------------------
 # OpenCascade (OCP) imports
 # ----------------------------
@@ -27,10 +28,10 @@ except Exception:
     OCP_AVAILABLE = False
 
 
-app = FastAPI(title="STEP Geometry API", version="2.0")
+app = FastAPI(title="STEP Geometry API", version="3.0")
 
 # ----------------------------
-# Job storage (async mode)
+# Config
 # ----------------------------
 JOB_DIR = Path(os.environ.get("JOB_DIR", "/tmp/step_jobs"))
 JOB_DIR.mkdir(parents=True, exist_ok=True)
@@ -38,18 +39,35 @@ JOB_DIR.mkdir(parents=True, exist_ok=True)
 MAX_DECODED_BYTES = int(os.environ.get("MAX_STEP_BYTES", str(80 * 1024 * 1024)))  # 80MB default
 
 
+# ----------------------------
+# Models
+# ----------------------------
 class AnalyzeBase64Request(BaseModel):
     filename: str
-    content_b64: str
+    # IMPORTANT: allow string OR dict/record (Copilot may send a file record)
+    content_b64: Any
 
 
+# ----------------------------
+# Health & root
+# ----------------------------
+@app.get("/")
+def root():
+    return {"service": "step-api-backend", "status": "running"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ----------------------------
+# Job storage helpers
+# ----------------------------
 def _job_path(job_id: str) -> Path:
     return JOB_DIR / f"{job_id}.json"
 
-
 def _write_job(job_id: str, payload: Dict[str, Any]) -> None:
     _job_path(job_id).write_text(json.dumps(payload), encoding="utf-8")
-
 
 def _read_job(job_id: str) -> Optional[Dict[str, Any]]:
     p = _job_path(job_id)
@@ -59,7 +77,7 @@ def _read_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ----------------------------
-# Base64 helpers
+# Base64 helpers (tolerant)
 # ----------------------------
 def _normalize_b64(b64: str) -> str:
     """
@@ -77,8 +95,46 @@ def _normalize_b64(b64: str) -> str:
     return s
 
 
-def _decode_b64_to_bytes(b64: str) -> bytes:
-    s = _normalize_b64(b64)
+def _extract_b64_maybe(obj: Any) -> str:
+    """
+    Accepts:
+      - base64 string
+      - dict with contentBytes / $content / content_b64 / content
+      - stringified JSON containing those keys
+    Returns the base64 string (or empty string).
+    """
+    if obj is None:
+        return ""
+
+    # dict/record case
+    if isinstance(obj, dict):
+        for k in ("content_b64", "contentBytes", "$content", "content", "data"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        return ""
+
+    # string case (might be base64 or a JSON string)
+    if isinstance(obj, str):
+        s = obj.strip()
+        if not s:
+            return ""
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict):
+                    return _extract_b64_maybe(parsed)
+            except Exception:
+                pass
+        return s
+
+    # unknown
+    return ""
+
+
+def _decode_b64_to_bytes(content_b64_any: Any) -> bytes:
+    raw = _extract_b64_maybe(content_b64_any)
+    s = _normalize_b64(raw)
     try:
         data = base64.b64decode(s, validate=True)
     except (binascii.Error, ValueError) as e:
@@ -110,7 +166,6 @@ def _ensure_ocp():
     if not OCP_AVAILABLE:
         raise HTTPException(status_code=500, detail="OpenCascade (OCP) not available in runtime environment.")
 
-
 def _read_step_shape(step_path: str):
     _ensure_ocp()
     reader = STEPControl_Reader()
@@ -120,7 +175,6 @@ def _read_step_shape(step_path: str):
     if not reader.TransferRoots():
         raise ValueError("STEP transfer failed (TransferRoots returned False).")
     return reader.OneShape()
-
 
 def _compute_bbox_mm(shape) -> Dict[str, float]:
     bbox = Bnd_Box()
@@ -135,13 +189,11 @@ def _compute_bbox_mm(shape) -> Dict[str, float]:
         "height_mm": float(zmax - zmin),
     }
 
-
 def _compute_volume_area(shape):
     vol_props = GProp_GProps()
     area_props = GProp_GProps()
     BRepGProp.VolumeProperties_s(shape, vol_props)
     BRepGProp.SurfaceProperties_s(shape, area_props)
-    # OCCT returns "Mass" for volume/area in current units (mm^3 / mm^2 typically)
     return float(vol_props.Mass()), float(area_props.Mass())
 
 
@@ -150,7 +202,6 @@ def analyze_step_bytes(step_bytes: bytes, filename: str) -> Dict[str, Any]:
     Writes STEP bytes to a temp file, reads via OCCT, returns bbox/volume/area.
     """
     _ensure_ocp()
-
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
@@ -175,14 +226,6 @@ def analyze_step_bytes(step_bytes: bytes, filename: str) -> Dict[str, Any]:
                 os.remove(tmp_path)
             except Exception:
                 pass
-
-
-# ----------------------------
-# Health
-# ----------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
 
 # ----------------------------
@@ -238,8 +281,7 @@ def analyze_base64(req: AnalyzeBase64Request):
 
     step_bytes = _decode_b64_to_bytes(req.content_b64)
     _basic_step_signature_check(step_bytes)
-    data = analyze_step_bytes(step_bytes, req.filename)
-    return data
+    return analyze_step_bytes(step_bytes, req.filename)
 
 
 # ----------------------------
@@ -247,8 +289,8 @@ def analyze_base64(req: AnalyzeBase64Request):
 # ----------------------------
 def _process_job(job_id: str, req: AnalyzeBase64Request) -> None:
     """
-    Runs in background after we return 202.
-    FastAPI BackgroundTasks is intended for "return now, work later". [1](https://learn.microsoft.com/en-us/answers/questions/93882/getting-the-server-didnot-receive-the-response-fro)[2](https://stackoverflow.com/questions/77174588/microsoft-power-apps-bad-gateway-error-on-app-that-was-working)
+    Runs after /analyze_base64_submit returns.
+    BackgroundTasks is intended for "return now, work later". [1](https://learn.microsoft.com/en-us/answers/questions/93882/getting-the-server-didnot-receive-the-response-fro)[2](https://stackoverflow.com/questions/77174588/microsoft-power-apps-bad-gateway-error-on-app-that-was-working)
     """
     try:
         _write_job(job_id, {"status": "processing", "updated_utc": time.time()})
@@ -268,8 +310,7 @@ def _process_job(job_id: str, req: AnalyzeBase64Request) -> None:
 @app.post("/analyze_base64_submit", status_code=202)
 async def analyze_base64_submit(req: AnalyzeBase64Request, background_tasks: BackgroundTasks):
     """
-    Return quickly with a job_id, then run OCCT work in the background.
-    This avoids long request timeouts. [1](https://learn.microsoft.com/en-us/answers/questions/93882/getting-the-server-didnot-receive-the-response-fro)[2](https://stackoverflow.com/questions/77174588/microsoft-power-apps-bad-gateway-error-on-app-that-was-working)
+    Returns quickly with job_id, then processes STEP in background. [1](https://learn.microsoft.com/en-us/answers/questions/93882/getting-the-server-didnot-receive-the-response-fro)[2](https://stackoverflow.com/questions/77174588/microsoft-power-apps-bad-gateway-error-on-app-that-was-working)
     """
     if not req.filename.lower().endswith((".stp", ".step")):
         raise HTTPException(status_code=400, detail="filename must end with .stp or .step")
@@ -287,3 +328,4 @@ async def analyze_result(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="job_id not found")
     return job
+``
