@@ -10,10 +10,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# -----------------------------
-# App
-# -----------------------------
-app = FastAPI(title="STEP Analyzer API (Async Safe for Copilot)", version="4.1")
+app = FastAPI(title="STEP Analyzer API (Async Safe for Copilot)", version="4.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,9 +20,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Job storage
-# -----------------------------
 JOBS_DIR = os.getenv("JOBS_DIR", "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 
@@ -114,15 +108,19 @@ class Base64Payload(BaseModel):
 
 def analyze_step_file(path_to_step: str) -> Dict[str, Any]:
     """
-    Returns bbox (mm), volume (cm^3), surface area (cm^2)
+    Returns bbox (mm), volume (cm^3), surface area (cm^2).
+    Assumption: STEP units are mm (common). If meters, scale upstream.
     """
     try:
         from OCP.STEPControl import STEPControl_Reader
         from OCP.IFSelect import IFSelect_RetDone
+
         from OCP.Bnd import Bnd_Box
-        from OCP.BRepBndLib import BRepBndLib
-        from OCP.BRepGProp import brepgprop_VolumeProperties, brepgprop_SurfaceProperties
+        from OCP.BRepBndLib import BRepBndLib  # bbox: BRepBndLib.Add [2](https://old.opencascade.com/doc/occt-6.9.0/refman/html/class_b_rep_bnd_lib.html)
+
+        from OCP.BRepGProp import BRepGProp    # props: BRepGProp.VolumeProperties/SurfaceProperties [1](http://doxygen.ihep.ac.cn/Open_Cascade/7.9.0/html/d7/d0b/classBRepGProp.html)
         from OCP.GProp import GProp_GProps
+
         from OCP.BRepMesh import BRepMesh_IncrementalMesh
     except Exception as e:
         raise RuntimeError(f"OCP import failed: {type(e).__name__}: {e}") from e
@@ -138,11 +136,13 @@ def analyze_step_file(path_to_step: str) -> Dict[str, Any]:
 
     shape = reader.OneShape()
 
+    # Optional mesh
     try:
         BRepMesh_IncrementalMesh(shape, 0.5)
     except Exception:
         pass
 
+    # Bounding box
     bbox = Bnd_Box()
     bbox.SetGap(0.0)
     BRepBndLib.Add(shape, bbox, True)
@@ -152,12 +152,13 @@ def analyze_step_file(path_to_step: str) -> Dict[str, Any]:
     W = float(ymax - ymin)
     H = float(zmax - zmin)
 
+    # Volume + surface area (OCCT static functions on BRepGProp) [1](http://doxygen.ihep.ac.cn/Open_Cascade/7.9.0/html/d7/d0b/classBRepGProp.html)
     props_vol = GProp_GProps()
-    brepgprop_VolumeProperties(shape, props_vol)
+    BRepGProp.VolumeProperties(shape, props_vol, False, False, False)
     volume_mm3 = float(props_vol.Mass())
 
     props_surf = GProp_GProps()
-    brepgprop_SurfaceProperties(shape, props_surf)
+    BRepGProp.SurfaceProperties(shape, props_surf, False, False)
     area_mm2 = float(props_surf.Mass())
 
     return {
@@ -187,8 +188,11 @@ def health():
 
 @app.get("/debug_ocp")
 def debug_ocp():
+    """
+    Confirms OCP import works (cadquery-ocp provides OCP module). [3](https://pypi.org/project/cadquery-ocp/)
+    """
     try:
-        from OCP.STEPControl import STEPControl_Reader  # noqa
+        from OCP.STEPControl import STEPControl_Reader  # noqa: F401
         return {"ok": True, "message": "OCP import OK"}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -204,7 +208,7 @@ def submit_base64(req: Base64Payload):
     except Exception:
         raise HTTPException(
             status_code=400,
-            detail="Invalid base64. Ensure content_base64 is a single-line base64 string."
+            detail="Invalid base64. Ensure content_base64 is a single-line base64 string (no line breaks)."
         )
 
     with open(p, "wb") as f:
@@ -212,6 +216,7 @@ def submit_base64(req: Base64Payload):
 
     set_status(job_id, "submitted")
     threading.Thread(target=process_job, args=(job_id, p), daemon=True).start()
+
     return {"job_id": job_id, "status": "submitted"}
 
 
