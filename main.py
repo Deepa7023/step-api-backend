@@ -4,7 +4,7 @@ import time
 import json
 import base64
 import threading
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,34 +24,34 @@ os.makedirs(JOBS_DIR, exist_ok=True)
 
 # ----------------- helpers -----------------
 
-def now():
+def now() -> float:
     return time.time()
 
-def job_dir(jid):
+def job_dir(jid: str) -> str:
     p = os.path.join(JOBS_DIR, jid)
     os.makedirs(p, exist_ok=True)
     return p
 
-def status_path(jid):
+def status_path(jid: str) -> str:
     return os.path.join(job_dir(jid), "status.json")
 
-def result_path(jid):
+def result_path(jid: str) -> str:
     return os.path.join(job_dir(jid), "result.json")
 
-def step_path(jid, name):
+def step_path(jid: str, name: str) -> str:
     return os.path.join(job_dir(jid), os.path.basename(name))
 
-def write_json(p, d):
-    with open(p, "w") as f:
-        json.dump(d, f)
+def write_json(p: str, d: dict) -> None:
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
 
-def read_json(p):
+def read_json(p: str):
     if not os.path.exists(p):
         return None
-    with open(p) as f:
+    with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def set_status(jid, status, extra=None):
+def set_status(jid: str, status: str, extra: dict | None = None) -> None:
     data = {"status": status, "updated_at": now()}
     if extra:
         data.update(extra)
@@ -63,15 +63,53 @@ class Base64Payload(BaseModel):
     filename: str
     content_base64: str
 
-# ----------------- STEP ANALYSIS (CORRECT OCP USAGE) -----------------
+# ----------------- OCP helper: robust bbox add -----------------
+def add_shape_to_bbox(shape, bbox) -> None:
+    """
+    Robust wrapper for OCCT BRepBndLib::Add across different OCP bindings.
+    OCCT canonical API is BRepBndLib::Add(shape, box, useTriangulation). [1](https://dev.opencascade.org/project/build123d)
+    Some Python wrappers expose this as brepbndlib.Add(...). [2](https://build123d.readthedocs.io/en/latest/import_export.html)
+    """
+    # Variant 1: class BRepBndLib with static Add
+    try:
+        from OCP.BRepBndLib import BRepBndLib
+        BRepBndLib.Add(shape, bbox, True)
+        return
+    except Exception:
+        pass
+
+    # Variant 2: pythonocc-style wrapper class 'brepbndlib' with method Add
+    try:
+        from OCP.BRepBndLib import brepbndlib
+        brepbndlib.Add(shape, bbox, True)
+        return
+    except Exception:
+        pass
+
+    # Variant 3: pythonocc free function name
+    try:
+        from OCP.BRepBndLib import brepbndlib_Add
+        brepbndlib_Add(shape, bbox, True)
+        return
+    except Exception:
+        pass
+
+    # Variant 4: module-level Add (some builds expose this)
+    try:
+        from OCP.BRepBndLib import Add
+        Add(shape, bbox, True)
+        return
+    except Exception as e:
+        raise RuntimeError(f"No compatible BRepBndLib Add symbol found in this OCP build: {e}")
+
+# ----------------- STEP ANALYSIS -----------------
 
 def analyze_step_file(step_file: str) -> Dict[str, Any]:
     try:
         from OCP.STEPControl import STEPControl_Reader
         from OCP.IFSelect import IFSelect_RetDone
         from OCP.Bnd import Bnd_Box
-        from OCP.BRepBndLib import Add            # ✅ CORRECT
-        from OCP.BRepGProp import BRepGProp       # ✅ CORRECT
+        from OCP.BRepGProp import BRepGProp
         from OCP.GProp import GProp_GProps
         from OCP.BRepMesh import BRepMesh_IncrementalMesh
     except Exception as e:
@@ -94,7 +132,7 @@ def analyze_step_file(step_file: str) -> Dict[str, Any]:
     # ---------- Bounding Box ----------
     bbox = Bnd_Box()
     bbox.SetGap(0.0)
-    Add(shape, bbox, True)
+    add_shape_to_bbox(shape, bbox)
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
 
     # ---------- Volume ----------
@@ -115,7 +153,7 @@ def analyze_step_file(step_file: str) -> Dict[str, Any]:
 
 # ----------------- background worker -----------------
 
-def process_job(jid, step_file):
+def process_job(jid: str, step_file: str) -> None:
     try:
         set_status(jid, "processing")
         result = analyze_step_file(step_file)
@@ -133,7 +171,7 @@ def health():
 @app.get("/debug_ocp")
 def debug_ocp():
     try:
-        from OCP.STEPControl import STEPControl_Reader
+        from OCP.STEPControl import STEPControl_Reader  # noqa: F401
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
