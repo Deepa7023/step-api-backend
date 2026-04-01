@@ -10,10 +10,11 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="STEP Analyzer API (Async Safe for Copilot)", version="3.2")
+app = FastAPI(title="STEP Analyzer API (Async Safe for Copilot)", version="4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,12 +25,12 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Job storage (Render free is ephemeral)
+# Job storage (Render Free is ephemeral; good enough for short jobs)
 # -----------------------------
 JOBS_DIR = os.getenv("JOBS_DIR", "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 
-JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))  # 1 hour
+JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))  # cleanup jobs older than 1 hour
 
 
 def now_ts() -> float:
@@ -42,6 +43,11 @@ def job_dir(job_id: str) -> str:
     return d
 
 
+def safe_filename(name: str) -> str:
+    name = name or "uploaded.step"
+    return os.path.basename(name)  # prevent traversal
+
+
 def status_path(job_id: str) -> str:
     return os.path.join(job_dir(job_id), "status.json")
 
@@ -50,10 +56,8 @@ def result_path(job_id: str) -> str:
     return os.path.join(job_dir(job_id), "result.json")
 
 
-def safe_step_path(job_id: str, filename: str) -> str:
-    name = filename or "uploaded.step"
-    name = os.path.basename(name)  # prevent path traversal
-    return os.path.join(job_dir(job_id), name)
+def step_path(job_id: str, filename: str) -> str:
+    return os.path.join(job_dir(job_id), safe_filename(filename))
 
 
 def write_json(path: str, data: dict) -> None:
@@ -76,7 +80,7 @@ def set_status(job_id: str, status: str, extra: Optional[dict] = None) -> None:
 
 
 def cleanup_old_jobs() -> None:
-    """Best-effort cleanup (safe for free tier)."""
+    """Best-effort cleanup; safe for free tier."""
     try:
         for jid in os.listdir(JOBS_DIR):
             d = os.path.join(JOBS_DIR, jid)
@@ -117,15 +121,15 @@ class Base64Payload(BaseModel):
 # -----------------------------
 # STEP analysis (cadquery-ocp / OCP)
 # -----------------------------
-def analyze_step_file(step_path: str) -> Dict[str, Any]:
+def analyze_step_file(path_to_step: str) -> Dict[str, Any]:
     """
     Returns:
       bbox_L_mm, bbox_W_mm, bbox_H_mm  (mm)
       volume_cm3 (cm^3)
       surface_area_cm2 (cm^2)
 
-    Assumption: STEP units are mm (common). If your STEP is in meters,
-    scale results accordingly upstream.
+    Assumption: STEP model units are mm (common in manufacturing). If your STEP is in meters,
+    scale accordingly in upstream logic.
     """
     try:
         from OCP.STEPControl import STEPControl_Reader
@@ -136,38 +140,38 @@ def analyze_step_file(step_path: str) -> Dict[str, Any]:
         from OCP.GProp import GProp_GProps
         from OCP.BRepMesh import BRepMesh_IncrementalMesh
     except Exception as e:
-        # show the real reason (missing module vs missing libs)
+        # IMPORTANT: show the real reason if imports fail
         raise RuntimeError(f"OCP import failed: {type(e).__name__}: {e}") from e
 
     # Read STEP
     reader = STEPControl_Reader()
-    status = reader.ReadFile(step_path)
+    status = reader.ReadFile(path_to_step)
     if status != IFSelect_RetDone:
-        raise RuntimeError("Failed to read STEP file")
+        raise RuntimeError("Failed to read STEP file (not a valid STEP or corrupted).")
 
     transferred = reader.TransferRoots()
     if transferred == 0:
-        raise RuntimeError("STEP transfer roots failed")
+        raise RuntimeError("STEP transfer roots failed (file may contain no valid shapes).")
 
     shape = reader.OneShape()
 
-    # Optional meshing (helps bbox/area/volume for some geometry)
+    # Optional mesh: helps bbox/props for some geometry
     try:
         BRepMesh_IncrementalMesh(shape, 0.5)
     except Exception:
         pass
 
-    # Bounding box (correct OCCT call: BRepBndLib.Add) [1](https://old.opencascade.com/doc/occt-6.9.0/refman/html/class_b_rep_bnd_lib.html)
+    # Bounding box (official OCCT static call is BRepBndLib.Add) [1](https://old.opencascade.com/doc/occt-6.9.0/refman/html/class_b_rep_bnd_lib.html)
     bbox = Bnd_Box()
     bbox.SetGap(0.0)
-    BRepBndLib.Add(shape, bbox, True)  # True = use triangulation if available
+    BRepBndLib.Add(shape, bbox, True)  # useTriangulation=True
 
     xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
     L = float(xmax - xmin)
     W = float(ymax - ymin)
     H = float(zmax - zmin)
 
-    # Volume and surface (assuming mm units)
+    # Volume + surface (units based on model; assuming mm)
     props_vol = GProp_GProps()
     brepgprop_VolumeProperties(shape, props_vol)
     volume_mm3 = float(props_vol.Mass())
@@ -190,12 +194,12 @@ def analyze_step_file(step_path: str) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Background worker
+# Background worker (async job)
 # -----------------------------
-def process_job(job_id: str, step_path: str) -> None:
+def process_job(job_id: str, step_file_path: str) -> None:
     try:
         set_status(job_id, "processing")
-        result = analyze_step_file(step_path)
+        result = analyze_step_file(step_file_path)
         write_json(result_path(job_id), result)
         set_status(job_id, "done")
     except Exception as e:
@@ -223,18 +227,20 @@ def debug_ocp():
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-# -------- Sync endpoints (optional) --------
+# -----------------------------
+# Sync endpoints (optional)
+# -----------------------------
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
-    path = safe_step_path(job_id, file.filename)
+    p = step_path(job_id, file.filename)
     data = await file.read()
 
-    with open(path, "wb") as f:
+    with open(p, "wb") as f:
         f.write(data)
 
     try:
-        result = analyze_step_file(path)
+        result = analyze_step_file(p)
         return {"status": "done", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -243,43 +249,45 @@ async def analyze(file: UploadFile = File(...)):
 @app.post("/analyze_base64")
 def analyze_base64(req: Base64Payload):
     job_id = str(uuid.uuid4())
-    path = safe_step_path(job_id, req.filename)
+    p = step_path(job_id, req.filename)
 
     try:
-        data = base64.b64decode(req.content_base64)
+        raw = base64.b64decode(req.content_base64, validate=True)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 content")
+        raise HTTPException(status_code=400, detail="Invalid base64 content (must be a single-line base64 string).")
 
-    with open(path, "wb") as f:
-        f.write(data)
+    with open(p, "wb") as f:
+        f.write(raw)
 
     try:
-        result = analyze_step_file(path)
+        result = analyze_step_file(p)
         return {"status": "done", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# -------- Async endpoints (USE THESE IN COPILOT FLOW) --------
+# -----------------------------
+# Async endpoints (USE THESE IN COPILOT FLOW)
+# -----------------------------
 @app.post("/submit_base64")
 def submit_base64(req: Base64Payload):
     """
-    FAST: save file + start background thread + return job_id immediately.
+    FAST: save STEP bytes + start background thread + return job_id immediately.
     """
     job_id = str(uuid.uuid4())
-    path = safe_step_path(job_id, req.filename)
+    p = step_path(job_id, req.filename)
 
     try:
-        data = base64.b64decode(req.content_base64)
+        raw = base64.b64decode(req.content_base64, validate=True)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 content")
+        raise HTTPException(status_code=400, detail="Invalid JSON/base64. Ensure content_base64 is valid base64 with no line breaks.")
 
-    with open(path, "wb") as f:
-        f.write(data)
+    with open(p, "wb") as f:
+        f.write(raw)
 
     set_status(job_id, "submitted")
 
-    t = threading.Thread(target=process_job, args=(job_id, path), daemon=True)
+    t = threading.Thread(target=process_job, args=(job_id, p), daemon=True)
     t.start()
 
     return {"job_id": job_id, "status": "submitted"}
@@ -311,3 +319,4 @@ def get_result(job_id: str):
         return {"status": "error", "error": st.get("error", "unknown")}
 
     return {"status": "processing"}
+``
