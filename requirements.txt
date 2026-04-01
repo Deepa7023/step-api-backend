@@ -1,6 +1,9 @@
-fastapi
-uvicorn[standard]
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+
 pydantic==1.10.13
-numpy
-python-multipart
+numpy==1.26.4
+
 cadquery-ocp==7.9.3.1
+
