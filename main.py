@@ -13,7 +13,7 @@ from pydantic import BaseModel
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="STEP Analyzer API (Async Safe for Copilot)", version="3.0")
+app = FastAPI(title="STEP Analyzer API (Async Safe for Copilot)", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,7 +87,6 @@ def cleanup_old_jobs() -> None:
                 continue
             updated_at = float(st.get("updated_at", 0))
             if now_ts() - updated_at > JOB_TTL_SECONDS:
-                # delete folder content
                 for root, dirs, files in os.walk(d, topdown=False):
                     for fn in files:
                         try:
@@ -137,9 +136,8 @@ def analyze_step_file(step_path: str) -> Dict[str, Any]:
         from OCP.GProp import GProp_GProps
         from OCP.BRepMesh import BRepMesh_IncrementalMesh
     except Exception as e:
-        raise RuntimeError(
-            "OCP/OpenCascade not available. Ensure requirements.txt includes OCP."
-        ) from e
+        # IMPORTANT: show the REAL reason (missing module vs missing libs)
+        raise RuntimeError(f"OCP import failed: {type(e).__name__}: {e}") from e
 
     reader = STEPControl_Reader()
     status = reader.ReadFile(step_path)
@@ -210,6 +208,16 @@ def process_job(job_id: str, step_path: str) -> None:
 def health():
     cleanup_old_jobs()
     return {"status": "ok", "time": now_ts()}
+
+
+# QUICK DEBUG endpoint: verifies OCP import without any STEP file
+@app.get("/debug_ocp")
+def debug_ocp():
+    try:
+        from OCP.STEPControl import STEPControl_Reader  # noqa
+        return {"ok": True, "message": "OCP import OK"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 # --- Sync endpoints (optional) ---
