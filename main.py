@@ -13,7 +13,7 @@ from pydantic import BaseModel
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="STEP Analyzer API (Async Safe for Copilot)", version="3.1")
+app = FastAPI(title="STEP Analyzer API (Async Safe for Copilot)", version="3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Job storage (ephemeral on Render Free)
+# Job storage (Render free is ephemeral)
 # -----------------------------
 JOBS_DIR = os.getenv("JOBS_DIR", "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
@@ -52,7 +52,7 @@ def result_path(job_id: str) -> str:
 
 def safe_step_path(job_id: str, filename: str) -> str:
     name = filename or "uploaded.step"
-    name = os.path.basename(name)  # prevent traversal
+    name = os.path.basename(name)  # prevent path traversal
     return os.path.join(job_dir(job_id), name)
 
 
@@ -76,7 +76,7 @@ def set_status(job_id: str, status: str, extra: Optional[dict] = None) -> None:
 
 
 def cleanup_old_jobs() -> None:
-    """Best-effort cleanup (safe for Render Free)."""
+    """Best-effort cleanup (safe for free tier)."""
     try:
         for jid in os.listdir(JOBS_DIR):
             d = os.path.join(JOBS_DIR, jid)
@@ -107,7 +107,7 @@ def cleanup_old_jobs() -> None:
 
 
 # -----------------------------
-# Request models
+# Request model
 # -----------------------------
 class Base64Payload(BaseModel):
     filename: str
@@ -115,7 +115,7 @@ class Base64Payload(BaseModel):
 
 
 # -----------------------------
-# STEP analysis (OCP/OpenCascade)
+# STEP analysis (cadquery-ocp / OCP)
 # -----------------------------
 def analyze_step_file(step_path: str) -> Dict[str, Any]:
     """
@@ -125,20 +125,21 @@ def analyze_step_file(step_path: str) -> Dict[str, Any]:
       surface_area_cm2 (cm^2)
 
     Assumption: STEP units are mm (common). If your STEP is in meters,
-    you must scale the results in your workflow.
+    scale results accordingly upstream.
     """
     try:
         from OCP.STEPControl import STEPControl_Reader
         from OCP.IFSelect import IFSelect_RetDone
-        from OCP.BRepBndLib import brepbndlib_Add
         from OCP.Bnd import Bnd_Box
+        from OCP.BRepBndLib import BRepBndLib
         from OCP.BRepGProp import brepgprop_VolumeProperties, brepgprop_SurfaceProperties
         from OCP.GProp import GProp_GProps
         from OCP.BRepMesh import BRepMesh_IncrementalMesh
     except Exception as e:
-        # IMPORTANT: show the REAL reason (missing module vs missing libs)
+        # show the real reason (missing module vs missing libs)
         raise RuntimeError(f"OCP import failed: {type(e).__name__}: {e}") from e
 
+    # Read STEP
     reader = STEPControl_Reader()
     status = reader.ReadFile(step_path)
     if status != IFSelect_RetDone:
@@ -150,23 +151,23 @@ def analyze_step_file(step_path: str) -> Dict[str, Any]:
 
     shape = reader.OneShape()
 
-    # optional mesh to improve properties for some geometry
+    # Optional meshing (helps bbox/area/volume for some geometry)
     try:
         BRepMesh_IncrementalMesh(shape, 0.5)
     except Exception:
         pass
 
-    # Bounding box
+    # Bounding box (correct OCCT call: BRepBndLib.Add) [1](https://old.opencascade.com/doc/occt-6.9.0/refman/html/class_b_rep_bnd_lib.html)
     bbox = Bnd_Box()
     bbox.SetGap(0.0)
-    brepbndlib_Add(shape, bbox)
-    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    BRepBndLib.Add(shape, bbox, True)  # True = use triangulation if available
 
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
     L = float(xmax - xmin)
     W = float(ymax - ymin)
     H = float(zmax - zmin)
 
-    # Volume and area (assuming mm units)
+    # Volume and surface (assuming mm units)
     props_vol = GProp_GProps()
     brepgprop_VolumeProperties(shape, props_vol)
     volume_mm3 = float(props_vol.Mass())
@@ -175,7 +176,7 @@ def analyze_step_file(step_path: str) -> Dict[str, Any]:
     brepgprop_SurfaceProperties(shape, props_surf)
     area_mm2 = float(props_surf.Mass())
 
-    # Convert to cm3, cm2
+    # Convert to cm^3 and cm^2
     volume_cm3 = volume_mm3 / 1000.0
     area_cm2 = area_mm2 / 100.0
 
@@ -210,22 +211,25 @@ def health():
     return {"status": "ok", "time": now_ts()}
 
 
-# QUICK DEBUG endpoint: verifies OCP import without any STEP file
 @app.get("/debug_ocp")
 def debug_ocp():
+    """
+    Quick check: confirms OCP import without needing any STEP file.
+    """
     try:
-        from OCP.STEPControl import STEPControl_Reader  # noqa
+        from OCP.STEPControl import STEPControl_Reader  # noqa: F401
         return {"ok": True, "message": "OCP import OK"}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-# --- Sync endpoints (optional) ---
+# -------- Sync endpoints (optional) --------
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
     path = safe_step_path(job_id, file.filename)
     data = await file.read()
+
     with open(path, "wb") as f:
         f.write(data)
 
@@ -256,11 +260,11 @@ def analyze_base64(req: Base64Payload):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- Async endpoints (USE THESE IN COPILOT FLOW) ---
+# -------- Async endpoints (USE THESE IN COPILOT FLOW) --------
 @app.post("/submit_base64")
 def submit_base64(req: Base64Payload):
     """
-    FAST: save file + start background thread + return job_id immediately
+    FAST: save file + start background thread + return job_id immediately.
     """
     job_id = str(uuid.uuid4())
     path = safe_step_path(job_id, req.filename)
@@ -284,7 +288,7 @@ def submit_base64(req: Base64Payload):
 @app.get("/result/{job_id}")
 def get_result(job_id: str):
     """
-    FAST polling:
+    Polling endpoint:
       {status: processing}
       {status: done, result: {...}}
       {status: error, error: "..."}
