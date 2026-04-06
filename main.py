@@ -51,7 +51,7 @@ async def root():
 async def health_check():
     """Detailed health check"""
     return {
-        "status": "healthy",
+        "status": "healthy",    
         "occt_available": processor.is_available(),
         "supported_formats": ["STEP", "STP"]
     }
