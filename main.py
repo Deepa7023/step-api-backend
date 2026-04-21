@@ -1,218 +1,229 @@
-"""
-STEP File Analysis API
-FastAPI backend for processing STEP files and extracting geometric and topology data
-"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>CAD-driven HPDC Estimator</title>
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import tempfile
-import os
-from typing import Dict, Any
-import logging
-
-from .step_processor import STEPProcessor
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Initialize FastAPI app
-app = FastAPI(
-    title="STEP File Analysis API",
-    description="API for analyzing STEP files and extracting geometric, topology, and metadata",
-    version="1.0.0"
-)
-
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize STEP processor
-processor = STEPProcessor()
-
-
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "STEP File Analysis API",
-        "version": "1.0.0"
+  <style>
+    /* ---------- Global ---------- */
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+      background: #f6f8f7;
+      color: #1f2937;
     }
 
-
-@app.get("/health")
-async def health_check():
-    """Detailed health check"""
-    return {
-        "status": "healthy",
-        "occt_available": processor.is_available(),
-        "supported_formats": ["STEP", "STP"]
+    /* ---------- Layout ---------- */
+    .app-layout {
+      display: grid;
+      grid-template-columns: 360px 1fr; /* ✅ Left panel expanded */
+      height: 100vh;
     }
 
+    /* ---------- Left Panel ---------- */
+    .left-panel {
+      background: #ffffff;
+      border-right: 1px solid #e5e7eb;
+      padding: 20px;
+      font-size: 0.95rem; /* ✅ Slight font increase */
+    }
 
-@app.post("/analyze")
-async def analyze_step_file(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """
-    Analyze a STEP file and return comprehensive data
-    
-    Args:
-        file: Uploaded STEP file (.step or .stp)
-    
-    Returns:
-        JSON with geometric properties, topology, metadata, and validation results
-    """
-    # Validate file extension
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
-    
-    file_ext = os.path.splitext(file.filename)[1].lower()
-    if file_ext not in ['.step', '.stp']:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type. Expected .step or .stp, got {file_ext}"
-        )
-    
-    # Create temporary file to save upload
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        logger.info(f"Processing file: {file.filename} ({len(content)} bytes)")
-        
-        # Process the STEP file
-        result = processor.analyze_file(temp_file_path)
-        
-        # Add original filename to result
-        result["file_info"]["original_filename"] = file.filename
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error processing file: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing STEP file: {str(e)}"
-        )
-    
-    finally:
-        # Clean up temporary file
-        if temp_file and os.path.exists(temp_file_path):
-            try:
-                os.unlink(temp_file_path)
-            except Exception as e:
-                logger.warning(f"Failed to delete temp file: {e}")
+    .heading-primary {
+      font-size: 1.15rem;
+      font-weight: 700; /* ✅ Bold heading */
+      margin-bottom: 6px;
+    }
 
+    .heading-sub {
+      font-size: 0.85rem;
+      color: #6b7280;
+      margin-bottom: 20px;
+    }
 
-@app.post("/analyze/geometry")
-async def analyze_geometry_only(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """
-    Extract only geometric properties from STEP file
-    
-    Args:
-        file: Uploaded STEP file
-    
-    Returns:
-        Geometric properties (volume, surface area, bounding box)
-    """
-    # Validate file
-    if not file.filename or not file.filename.lower().endswith(('.step', '.stp')):
-        raise HTTPException(status_code=400, detail="Invalid STEP file")
-    
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.step') as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        result = processor.get_geometric_properties(temp_file_path)
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error processing geometry: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        if temp_file and os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
+    .left-section {
+      margin-bottom: 20px;
+    }
 
+    .label {
+      font-size: 0.8rem;
+      color: #6b7280;
+      margin-bottom: 4px;
+    }
 
-@app.post("/analyze/topology")
-async def analyze_topology_only(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """
-    Extract only topology information from STEP file
-    
-    Args:
-        file: Uploaded STEP file
-    
-    Returns:
-        Topology counts (solids, shells, faces, edges, vertices)
-    """
-    if not file.filename or not file.filename.lower().endswith(('.step', '.stp')):
-        raise HTTPException(status_code=400, detail="Invalid STEP file")
-    
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.step') as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        result = processor.get_topology_info(temp_file_path)
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error processing topology: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        if temp_file and os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
+    .value {
+      font-weight: 600;
+      padding: 8px 10px;
+      border: 1px dashed #10b981;
+      border-radius: 6px;
+      background: #ecfdf5;
+    }
 
+    .button {
+      margin-top: 20px;
+      width: 100%;
+      padding: 10px;
+      background: linear-gradient(90deg, #10b981, #f59e0b);
+      border: none;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #ffffff;
+      cursor: pointer;
+    }
 
-@app.post("/validate")
-async def validate_step_file(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """
-    Validate STEP file quality and structure
-    
-    Args:
-        file: Uploaded STEP file
-    
-    Returns:
-        Validation results and quality metrics
-    """
-    if not file.filename or not file.filename.lower().endswith(('.step', '.stp')):
-        raise HTTPException(status_code=400, detail="Invalid STEP file")
-    
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.step') as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        result = processor.validate_file(temp_file_path)
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error validating file: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        if temp_file and os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
+    /* ---------- Main Content ---------- */
+    .main-content {
+      padding: 24px;
+      overflow-y: auto;
+    }
 
+    .card {
+      background: #ffffff;
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 16px;
+      border: 1px solid #e5e7eb;
+    }
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    /* ---------- Section Headings ---------- */
+    .section-heading {
+      font-size: 0.95rem;
+      font-weight: 600;
+      margin-bottom: 12px;
+      color: #065f46;
+    }
+
+    /* ---------- Geometry Grid ---------- */
+    .geometry-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+    }
+
+    .metric {
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      padding: 10px 12px;
+      background: #ffffff;
+    }
+
+    .metric-label {
+      font-size: 0.75rem;
+      color: #6b7280;
+    }
+
+    .metric-value {
+      font-size: 0.9rem;
+      font-weight: 600;
+      margin-top: 4px;
+    }
+
+    /* ---------- Cost ---------- */
+    .cost-value {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: #047857;
+    }
+
+    .cost-range {
+      font-size: 0.8rem;
+      color: #f97316;
+    }
+
+  </style>
+</head>
+
+<body>
+
+  <div class="app-layout">
+
+    <!-- ================= Left Panel ================= -->
+    <aside class="left-panel">
+      <div class="heading-primary">CAD‑driven HPDC estimator</div>
+      <div class="heading-sub">Engineer cost intelligence console</div>
+
+      <div class="left-section">
+        <div class="label">CAD file</div>
+        <div class="value">XU‑EM0902‑300_A.stp</div>
+      </div>
+
+      <div class="left-section">
+        <div class="label">Manufacturing location</div>
+        <div class="value">India (Pune)</div>
+      </div>
+
+      <div class="left-section">
+        <div class="label">Alloy</div>
+        <div class="value">Aluminum A356</div>
+      </div>
+
+      <div class="left-section">
+        <div class="label">Pieces per year</div>
+        <div class="value">12,000</div>
+      </div>
+
+      <button class="button">Run per‑part estimation</button>
+    </aside>
+
+    <!-- ================= Main Content ================= -->
+    <main class="main-content">
+
+      <!-- Cost -->
+      <div class="card">
+        <div class="section-heading">Per‑part HPDC cost (Estimated)</div>
+        <div class="cost-value">₹772.48</div>
+        <div class="cost-range">Expected range: ₹718.41 – ₹826.55</div>
+      </div>
+
+      <!-- Geometry -->
+      <div class="card">
+        <div class="section-heading">▸ Geometry extracted from CAD</div>
+
+        <div class="geometry-grid">
+          <div class="metric">
+            <div class="metric-label">Bounding box X (mm)</div>
+            <div class="metric-value">95.17</div>
+          </div>
+
+          <div class="metric">
+            <div class="metric-label">Bounding box Y (mm)</div>
+            <div class="metric-value">62.18</div>
+          </div>
+
+          <div class="metric">
+            <div class="metric-label">Bounding box Z (mm)</div>
+            <div class="metric-value">52.18</div>
+          </div>
+
+          <div class="metric">
+            <div class="metric-label">Volume (cm³)</div>
+            <div class="metric-value">183.47</div>
+          </div>
+
+          <div class="metric">
+            <div class="metric-label">Surface area (cm²)</div>
+            <div class="metric-value">513.92</div>
+          </div>
+
+          <div class="metric">
+            <div class="metric-label">Casting weight (kg)</div>
+            <div class="metric-value">0.49</div>
+          </div>
+
+          <div class="metric">
+            <div class="metric-label">Estimated projected area (cm²)</div>
+            <div class="metric-value">491.7</div>
+          </div>
+
+          <div class="metric">
+            <div class="metric-label">Estimated HPDC tonnage</div>
+            <div class="metric-value">780 T</div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+</body>
+</html>
