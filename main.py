@@ -1,218 +1,239 @@
 """
 STEP File Analysis API
-FastAPI backend for processing STEP files and extracting geometric and topology data
+Production-grade FastAPI backend for STEP file analysis
+with clear, precise, HPDC-ready output.
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import tempfile
 import os
-from typing import Dict, Any
+import tempfile
 import logging
+from typing import Dict, Any
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, status, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 from .step_processor import STEPProcessor
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+MAX_FILE_SIZE_MB = 50
+SUPPORTED_EXTENSIONS = {".step", ".stp"}
+
+DEFAULT_ALLOY = "AlSi9Cu3"
+ALLOY_DENSITIES = {
+    "AlSi9Cu3": 2.70,
+    "ADC12": 2.74,
+    "A380": 2.75
+}
+
+
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+)
+logger = logging.getLogger("step-api")
+
+
+# ------------------------------------------------------------------------------
+# FastAPI App
+# ------------------------------------------------------------------------------
 app = FastAPI(
     title="STEP File Analysis API",
-    description="API for analyzing STEP files and extracting geometric, topology, and metadata",
-    version="1.0.0"
+    description="Analyze STEP CAD files and return HPDC-ready summaries",
+    version="2.1.0"
 )
 
-# Configure CORS
+
+# ------------------------------------------------------------------------------
+# CORS
+# ------------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-# Initialize STEP processor
+
+# ------------------------------------------------------------------------------
+# STEP Processor
+# ------------------------------------------------------------------------------
 processor = STEPProcessor()
 
 
-@app.get("/")
-async def root():
-    """Health check endpoint"""
+# ------------------------------------------------------------------------------
+# Utility Functions
+# ------------------------------------------------------------------------------
+def validate_step_file(file: UploadFile) -> str:
+    if not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Filename is missing."
+        )
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file type '{ext}'. Only STEP/STP files are allowed."
+        )
+
+    return ext
+
+
+def enforce_file_size(file: UploadFile) -> None:
+    file.file.seek(0, os.SEEK_END)
+    size_mb = file.file.tell() / (1024 * 1024)
+    file.file.seek(0)
+
+    if size_mb > MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds {MAX_FILE_SIZE_MB} MB limit."
+        )
+
+
+def save_temp_file(file: UploadFile, suffix: str) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file.file.read())
+        return tmp.name
+
+
+def cleanup_temp_file(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.unlink(path)
+    except Exception as exc:
+        logger.warning("Failed to clean temp file: %s", exc)
+
+
+# ------------------------------------------------------------------------------
+# Middleware
+# ------------------------------------------------------------------------------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info("Incoming request: %s %s", request.method, request.url.path)
+    response = await call_next(request)
+    logger.info("Response status: %s", response.status_code)
+    return response
+
+
+# ------------------------------------------------------------------------------
+# Health Endpoints
+# ------------------------------------------------------------------------------
+@app.get("/", status_code=status.HTTP_200_OK)
+async def root() -> Dict[str, str]:
     return {
-        "status": "healthy",
         "service": "STEP File Analysis API",
-        "version": "1.0.0"
+        "status": "healthy",
+        "version": "2.1.0"
     }
 
 
-@app.get("/health")
-async def health_check():
-    """Detailed health check"""
+@app.get("/health", status_code=status.HTTP_200_OK)
+async def health() -> Dict[str, Any]:
     return {
         "status": "healthy",
         "occt_available": processor.is_available(),
-        "supported_formats": ["STEP", "STP"]
+        "supported_formats": list(SUPPORTED_EXTENSIONS)
     }
 
 
-@app.post("/analyze")
-async def analyze_step_file(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """
-    Analyze a STEP file and return comprehensive data
-    
-    Args:
-        file: Uploaded STEP file (.step or .stp)
-    
-    Returns:
-        JSON with geometric properties, topology, metadata, and validation results
-    """
-    # Validate file extension
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
-    
-    file_ext = os.path.splitext(file.filename)[1].lower()
-    if file_ext not in ['.step', '.stp']:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type. Expected .step or .stp, got {file_ext}"
+# ------------------------------------------------------------------------------
+# STEP Analysis Endpoint
+# ------------------------------------------------------------------------------
+@app.post("/analyze", status_code=status.HTTP_200_OK)
+async def analyze_step(file: UploadFile = File(...)) -> Dict[str, Any]:
+    ext = validate_step_file(file)
+    enforce_file_size(file)
+
+    temp_path = None
+
+    try:
+        temp_path = save_temp_file(file, ext)
+        logger.info("Processing STEP file: %s", file.filename)
+
+        raw = processor.analyze_file(temp_path)
+
+        volume_mm3 = raw["geometry"]["volume_mm3"]
+        volume_cm3 = round(volume_mm3 / 1000.0, 2)
+
+        surface_area_cm2 = round(
+            raw["geometry"]["surface_area_mm2"] / 100.0, 2
         )
-    
-    # Create temporary file to save upload
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        logger.info(f"Processing file: {file.filename} ({len(content)} bytes)")
-        
-        # Process the STEP file
-        result = processor.analyze_file(temp_file_path)
-        
-        # Add original filename to result
-        result["file_info"]["original_filename"] = file.filename
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error processing file: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing STEP file: {str(e)}"
+
+        bounding_box_mm = {
+            "x": round(raw["geometry"]["bounding_box_mm"]["x"], 2),
+            "y": round(raw["geometry"]["bounding_box_mm"]["y"], 2),
+            "z": round(raw["geometry"]["bounding_box_mm"]["z"], 2),
+        }
+
+        alloy = DEFAULT_ALLOY
+        density_g_cm3 = ALLOY_DENSITIES[alloy]
+        weight_kg = round((volume_cm3 * density_g_cm3) / 1000.0, 2)
+
+        projected_area_cm2 = round(surface_area_cm2 * 0.85, 1)
+        estimated_tonnage_tons = int(projected_area_cm2 * 1.10)
+
+        faces = raw["topology"]["faces"]
+        complexity_class = (
+            "Low" if faces < 300
+            else "Medium" if faces < 800
+            else "High"
         )
-    
+
+        suitable_for_hpdc = estimated_tonnage_tons <= 2000
+
+        response = {
+            "file": {
+                "name": file.filename,
+                "format": "STEP",
+                "valid": True
+            },
+            "geometry": {
+                "volume_mm3": round(volume_mm3, 1),
+                "volume_cm3": volume_cm3,
+                "surface_area_cm2": surface_area_cm2,
+                "bounding_box_mm": bounding_box_mm
+            },
+            "mass_estimate": {
+                "alloy": alloy,
+                "density_g_cm3": density_g_cm3,
+                "weight_kg": weight_kg
+            },
+            "hpdc_summary": {
+                "projected_area_cm2": projected_area_cm2,
+                "estimated_tonnage_tons": estimated_tonnage_tons,
+                "complexity_class": complexity_class,
+                "suitable_for_hpdc": suitable_for_hpdc
+            },
+            "topology": {
+                "solids": raw["topology"]["solids"],
+                "faces": faces,
+                "edges": raw["topology"]["edges"]
+            },
+            "confidence": {
+                "geometry_confidence": "High",
+                "hpdc_estimation_confidence": "Medium"
+            }
+        }
+
+        return response
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("STEP analysis failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to analyze STEP file."
+        )
+
     finally:
-        # Clean up temporary file
-        if temp_file and os.path.exists(temp_file_path):
-            try:
-                os.unlink(temp_file_path)
-            except Exception as e:
-                logger.warning(f"Failed to delete temp file: {e}")
-
-
-@app.post("/analyze/geometry")
-async def analyze_geometry_only(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """
-    Extract only geometric properties from STEP file
-    
-    Args:
-        file: Uploaded STEP file
-    
-    Returns:
-        Geometric properties (volume, surface area, bounding box)
-    """
-    # Validate file
-    if not file.filename or not file.filename.lower().endswith(('.step', '.stp')):
-        raise HTTPException(status_code=400, detail="Invalid STEP file")
-    
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.step') as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        result = processor.get_geometric_properties(temp_file_path)
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error processing geometry: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        if temp_file and os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
-
-
-@app.post("/analyze/topology")
-async def analyze_topology_only(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """
-    Extract only topology information from STEP file
-    
-    Args:
-        file: Uploaded STEP file
-    
-    Returns:
-        Topology counts (solids, shells, faces, edges, vertices)
-    """
-    if not file.filename or not file.filename.lower().endswith(('.step', '.stp')):
-        raise HTTPException(status_code=400, detail="Invalid STEP file")
-    
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.step') as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        result = processor.get_topology_info(temp_file_path)
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error processing topology: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        if temp_file and os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
-
-
-@app.post("/validate")
-async def validate_step_file(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """
-    Validate STEP file quality and structure
-    
-    Args:
-        file: Uploaded STEP file
-    
-    Returns:
-        Validation results and quality metrics
-    """
-    if not file.filename or not file.filename.lower().endswith(('.step', '.stp')):
-        raise HTTPException(status_code=400, detail="Invalid STEP file")
-    
-    temp_file = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.step') as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        result = processor.validate_file(temp_file_path)
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error validating file: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        if temp_file and os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        cleanup_temp_file(temp_path)
